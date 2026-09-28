@@ -1,8 +1,9 @@
+import bisect
 import json
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from fastapi import Body, FastAPI, Path, Query
 from fastapi.responses import JSONResponse
@@ -200,6 +201,109 @@ def remove_event_from_views(conn: sqlite3.Connection, *, occurred_at: str, paylo
                 " WHERE view_id = ? AND day = ? AND count <= 0",
                 (view["id"], day),
             )
+
+
+# ---------- field coverage: 快照字段覆盖画像 ----------
+
+# 画像使用的六种 JSON 类型(标量统一四类, 整数与浮点不区分)
+FIELD_TYPES: tuple[str, ...] = ("object", "array", "string", "number", "boolean", "null")
+
+
+def json_type_of(value: Any) -> str:
+    """JSON 类型名: 注意 bool 是 int 的子类, 必须先判 bool。"""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
+def escape_field_key(key: str) -> str:
+    """对象键的路径段转义: ~ -> ~0, / -> ~1, * -> ~2(~ 最先, 避免二次转义)。"""
+    return key.replace("~", "~0").replace("/", "~1").replace("*", "~2")
+
+
+def iter_payload_paths(payload: Any) -> Iterator[tuple[str, str]]:
+    """迭代产出 (path, json_type): 根路径为空串, 对象键按 JSON Pointer 转义,
+    数组下标统一为 "*"。空数组不产生元素路径; 同一事件内同一路径可能出现
+    多次(数组多个元素), 由调用方按 (path, type) 去重。"""
+    # 显式栈的迭代遍历, 避免深层 JSON 触发递归上限
+    stack: list[tuple[str, Any]] = [("", payload)]
+    while stack:
+        path, value = stack.pop()
+        yield path, json_type_of(value)
+        if isinstance(value, dict):
+            # 倒序压栈使遍历顺序无关紧要(最终由集合去重 + 字典序排序)
+            for key in reversed(list(value.keys())):
+                stack.append((f"{path}/{escape_field_key(key)}", value[key]))
+        elif isinstance(value, list) and value:
+            # 非空数组才压入元素: 空数组不产生元素路径
+            for element in reversed(value):
+                stack.append((f"{path}/*", element))
+
+
+def valid_field_path(path: str) -> bool:
+    """游标路径是否合法: 必须是合法的路径转义。
+
+    - 根路径为空串; 非根路径以 "/" 开头;
+    - "~" 后只允许 0/1/2; 裸 "*" 是数组下标占位段, 不能出现在键段内部
+      (键里的星号必已转义为 ~2)。
+    """
+    if path == "":
+        return True
+    if not path.startswith("/"):
+        return False
+    i, n = 1, len(path)
+    while i < n:
+        c = path[i]
+        if c == "~":
+            if i + 1 >= n or path[i + 1] not in "012":
+                return False
+            i += 2
+        elif c == "*":
+            # 合法位置仅为整个元素段: 形如 "/*" 或 "/*/"
+            if not (i == 1 or path[i - 1] == "/") or (
+                i + 1 < n and path[i + 1] != "/"
+            ):
+                return False
+            i += 1
+        else:
+            i += 1
+    return True
+
+
+def aggregate_field_coverage(payloads: Iterator[Any]) -> tuple[int, dict[str, dict[str, Any]]]:
+    """聚合多条事件 payload 的字段覆盖: 返回 (事件总数, {path: stats})。
+
+    同一事件内同一路径只计一次出现, 同一 (路径, 类型) 也只计一次——
+    因此混合数组会让类型计数之和超过出现次数; null 计为出现。
+    """
+    total = 0
+    paths: dict[str, dict[str, Any]] = {}
+    for payload in payloads:
+        total += 1
+        # 出现按路径去重(同一路径在一个事件中只计一次), 类型按 (路径, 类型)
+        # 去重(每种类型也只计一次); 两者分开, 混合数组的类型数之和才可能超过出现数
+        seen_paths: set[str] = set()
+        seen_path_types: set[tuple[str, str]] = set()
+        for p, t in iter_payload_paths(payload):
+            seen_paths.add(p)
+            seen_path_types.add((p, t))
+        for p in seen_paths:
+            stats = paths.get(p)
+            if stats is None:
+                stats = {"present": 0, "types": {t: 0 for t in FIELD_TYPES}}
+                paths[p] = stats
+            stats["present"] += 1
+        for p, t in seen_path_types:
+            paths[p]["types"][t] += 1
+    return total, paths
 
 
 # ---------- endpoints ----------
@@ -1118,6 +1222,88 @@ def list_export_events(
         "events": [row_to_export_event(r) for r in rows],
         # 末页(含空页)为 null
         "next_after_seq": rows[-1]["seq"] if has_more else None,
+    }
+
+
+@app.get("/exports/{export_id}/field-coverage")
+def export_field_coverage(
+    export_id: int = Path(...),
+    after_path: Optional[str] = Query(
+        None,
+        description="分页游标(不含), 仅返回路径字典序大于它的项; 缺省从头(含根路径 '')",
+    ),
+    limit: int = Query(100, ge=1, le=1000, description="每页路径数, 默认 100, 范围 1~1000"),
+):
+    """读取快照副本的字段覆盖画像: 按 payload 路径统计出现/缺失事件数与各 JSON 类型事件数。
+
+    用于排查事件载荷格式不一致(某字段时有时无、同一路径出现多种类型)。全部统计
+    只来自 export_events 快照副本, 不读不写 events 表, 也不返回任何具体字段值。
+
+    - 递归包含根、对象、数组与标量: 根路径为空串 ""; 对象键按 JSON Pointer
+      风格编码(~、/、* 分别转义为 ~0、~1、~2); 数组下标统一为 "*"。
+    - 同一事件内同一路径只计一次出现, 同一(路径, 类型)也只计一次; 混合数组
+      可使各类型计数之和超过出现数; null 计为出现; 空数组不产生元素路径。
+    - 按路径字典序分页: 只取严格大于 after_path 的项, 缺省从头; next_after_path
+      为下一页游标, 末页为 null。空快照返回 total=0 与空列表。
+    - 快照未知或已删除返回 404; limit 越界或 after_path 不是合法路径编码返回 422。
+    """
+    with get_conn() as conn:
+        snap = conn.execute(
+            "SELECT id FROM export_snapshots WHERE id = ?",
+            (export_id,),
+        ).fetchone()
+        # 未知或已删除的快照统一 404
+        if snap is None:
+            return JSONResponse(status_code=404, content={"detail": "export not found"})
+
+        cursor = "" if after_path is None else after_path
+        if not valid_field_path(cursor):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "after_path is not a valid encoded path", "after_path": cursor},
+            )
+
+        rows = conn.execute(
+            "SELECT payload FROM export_events WHERE snapshot_id = ? ORDER BY seq",
+            (export_id,),
+        ).fetchall()
+
+    total, path_stats = aggregate_field_coverage(json.loads(r["payload"]) for r in rows)
+    # 副本不可变: 聚合计数即快照 total, 空快照天然得到 0 与空路径集
+    all_paths = sorted(path_stats)
+    if after_path is None:
+        # 缺省从头: 含根路径 ""
+        start_idx = 0
+    else:
+        # 显式游标: 只取严格大于游标的路径(bisect_right 为 > 语义);
+        # 显式 after_path="" 与缺省不同, 会跳过根路径
+        start_idx = bisect.bisect_right(all_paths, cursor)
+    page_paths = all_paths[start_idx : start_idx + limit]
+
+    items: list[dict[str, Any]] = []
+    for p in page_paths:
+        stats = path_stats[p]
+        present = stats["present"]
+        # 只列出计数 > 0 的类型; 顺序固定为 FIELD_TYPES
+        types = {t: c for t, c in stats["types"].items() if c > 0}
+        items.append(
+            {
+                "path": p,
+                "present_events": present,
+                "missing_events": total - present,
+                "type_events": types,
+            }
+        )
+
+    has_more = start_idx + limit < len(all_paths)
+    return {
+        "export_id": export_id,
+        "total": total,
+        "after_path": cursor,
+        "limit": limit,
+        "items": items,
+        # 末页(含空页、空快照)为 null
+        "next_after_path": page_paths[-1] if has_more else None,
     }
 
 
