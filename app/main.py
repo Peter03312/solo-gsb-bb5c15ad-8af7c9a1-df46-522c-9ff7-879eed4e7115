@@ -1,3 +1,4 @@
+import bisect
 import json
 import secrets
 import sqlite3
@@ -150,6 +151,57 @@ def row_to_export_event(row: sqlite3.Row) -> dict[str, Any]:
         "prev_hash": row["prev_hash"],
         "hash": row["hash"],
     }
+
+
+# 路径画像的 JSON 类型(RFC 8259), 同时作为输出中 types 对象的固定键序
+JSON_TYPES = ("null", "boolean", "number", "string", "array", "object")
+
+
+def escape_pointer_key(key: str) -> str:
+    """对象键的 JSON Pointer 编码: ~ -> ~0, / -> ~1, * -> ~2(顺序: ~ 先转义)。"""
+    return key.replace("~", "~0").replace("/", "~1").replace("*", "~2")
+
+
+def json_type_name(value: Any) -> str:
+    """标量/容器的 JSON 类型名; bool 不是 number, 须先于 int 判断。"""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
+def collect_payload_paths(value: Any) -> tuple[set[str], set[tuple[str, str]]]:
+    """递归收集一个 payload 内出现的全部路径及 (路径, 类型) 对。
+
+    - 根路径为空字符串 ""; 对象键按 JSON Pointer 编码(~、/、* 分别转义为
+      ~0/~1/~2); 数组下标统一为 "*"(不区分子元素位置)。
+    - null 计为出现但不递归; 空数组不产生元素路径; 空对象也没有子路径。
+    - 返回的两个集合保证"同一事件中同路径只计一次、每种类型也只计一次":
+      数组内多个元素落在同一路径时天然去重, 混合数组会为同一路径贡献多种类型。
+    """
+    paths: set[str] = set()
+    path_types: set[tuple[str, str]] = set()
+
+    def walk(node: Any, path: str) -> None:
+        paths.add(path)
+        path_types.add((path, json_type_name(node)))
+        if isinstance(node, dict):
+            for key, child in node.items():
+                walk(child, f"{path}/{escape_pointer_key(str(key))}")
+        elif isinstance(node, list):
+            for child in node:
+                # 数组下标统一为 "*": 不同位置的同构元素在此去重
+                walk(child, f"{path}/*")
+
+    walk(value, "")
+    return paths, path_types
 
 
 def view_matches(filters: dict[str, str], payload: Any) -> bool:
@@ -1118,6 +1170,91 @@ def list_export_events(
         "events": [row_to_export_event(r) for r in rows],
         # 末页(含空页)为 null
         "next_after_seq": rows[-1]["seq"] if has_more else None,
+    }
+
+
+@app.get("/exports/{export_id}/profile")
+def get_export_profile(
+    export_id: int = Path(...),
+    after_path: Optional[str] = Query(
+        None,
+        description="只返回路径字典序严格大于该值的项; 缺省(从头, 含根路径 \"\")",
+    ),
+    limit: int = Query(100, ge=1, le=1000, description="每页条数, 默认 100, 范围 1~1000"),
+):
+    """快照事件的字段覆盖画像: 只读快照副本, 不返回具体字段值, 不改原事件与快照。
+
+    遍历快照内每个事件的 payload(根路径为 "", 对象键按 JSON Pointer 编码,
+    数组下标统一为 "*"), 按路径汇总:
+    - present/missing: 该路径出现/缺失的事件数(null 也算出现);
+      同一事件中同一路径只计一次;
+    - types: 各 JSON 类型(null/boolean/number/string/array/object)的事件数,
+      同一事件中每种类型只计一次; 混合数组可使类型数之和超过出现数。
+
+    结果按路径字典序分页: 仅取严格大于 after_path 的项, 缺省从头;
+    next_after_path 为末项路径, 末页为 null(空快照返回 total=0 与空列表)。
+    未知或已删除的快照返回 404; limit 越界(1~1000)由校验拦截为 422。
+    """
+    with get_conn() as conn:
+        snap = conn.execute(
+            "SELECT total FROM export_snapshots WHERE id = ?",
+            (export_id,),
+        ).fetchone()
+        # 未知或已删除的快照统一 404(与 /exports/{id}/events 一致)
+        if snap is None:
+            return JSONResponse(status_code=404, content={"detail": "export not found"})
+        total = snap["total"]
+
+        # 路径 -> 出现事件数; (路径, 类型) -> 事件数。内存聚合, 只读副本。
+        present_counts: dict[str, int] = {}
+        type_counts: dict[tuple[str, str], int] = {}
+        rows = conn.execute(
+            "SELECT payload FROM export_events WHERE snapshot_id = ? ORDER BY seq",
+            (export_id,),
+        ).fetchall()
+
+    for row in rows:
+        payload = json.loads(row["payload"])
+        paths, path_types = collect_payload_paths(payload)
+        for path in paths:
+            present_counts[path] = present_counts.get(path, 0) + 1
+        for path, type_name in path_types:
+            key = (path, type_name)
+            type_counts[key] = type_counts.get(key, 0) + 1
+
+    all_paths = sorted(present_counts)
+
+    # 字典序严格大于 after_path; 缺省从头(含根路径 "")
+    start_index = 0 if after_path is None else bisect.bisect_right(all_paths, after_path)
+    page_paths = all_paths[start_index : start_index + limit]
+
+    items: list[dict[str, Any]] = []
+    for path in page_paths:
+        present = present_counts[path]
+        types = {
+            type_name: type_counts[(path, type_name)]
+            for type_name in JSON_TYPES
+            if (path, type_name) in type_counts
+        }
+        items.append(
+            {
+                "path": path,
+                "present": present,
+                "missing": total - present,
+                "types": types,
+            }
+        )
+
+    # 还有被 limit 截掉的项时 next_after_path 为本页末项路径, 末页为 null
+    next_after_path = page_paths[-1] if start_index + limit < len(all_paths) else None
+    return {
+        "export_id": export_id,
+        "total": total,
+        "after_path": after_path,
+        "limit": limit,
+        "count": len(items),
+        "paths": items,
+        "next_after_path": next_after_path,
     }
 
 
